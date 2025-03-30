@@ -9,7 +9,7 @@ from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
 # Configuration
 MOVEMENT_THRESHOLD = 0.6  # IoU threshold - below this triggers alert
 CHECK_FREQUENCY = 1  # Check every N seconds
-CONFIDENCE_THRESHOLD = 0.5  # Minimum confidence for object detection
+CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence for object detection
 
 # Storage for protected items
 protected_items = []
