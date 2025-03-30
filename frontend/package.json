@@ -14,7 +14,8 @@
 		"react": "^19.1.0",
 		"react-dom": "^19.1.0",
 		"react-scripts": "5.0.1",
-		"web-vitals": "^2.1.4"
+		"web-vitals": "^2.1.4",
+		"socket.io-client": "^4.7.2"
 	},
 	"scripts": {
 		"proxy": "http://localhost:5000",
