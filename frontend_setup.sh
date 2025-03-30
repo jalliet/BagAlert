@@ -1,6 +1,6 @@
 #!/bin/bash
 
 # Frontend setup
-cd ../frontend
+cd frontend
 npm install --force
 npm run start
