@@ -1,303 +1,314 @@
-from flask import Flask, Response, render_template
 import cv2
-import threading
 import time
 import numpy as np
-import io
-from PIL import Image
+import base64
+import asyncio
+from typing import List
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
 from modlib.apps import Annotator
 from modlib.devices import AiCamera
 from modlib.models.zoo import SSDMobileNetV2FPNLite320x320
 
-app = Flask(__name__)
+# Global variables
+camera_task = None
+frame_rate = 30
+last_frame = None
 
-# Global variables for the stream
-output_frame = None
-lock = threading.Lock()
-camera_running = False
-frame_rate = 30  # Default frame rate (FPS)
+device = AiCamera()
+model = SSDMobileNetV2FPNLite320x320()
 
-def detect_objects():
-	"""
-	Main function to capture the video feed, run object detection, 
-	and update the global output_frame
-	"""
-	global output_frame, lock, camera_running
-	
-	try:
-		# Initialize the camera and model
-		device = AiCamera()
-		model = SSDMobileNetV2FPNLite320x320()
-		
-		# Deploy the model only once - this addresses the "device busy" error
-		try:
-			device.deploy(model)
-		except RuntimeError as e:
-			print(f"Warning: Failed to deploy model: {e}")
-			print("Trying to continue without redeploying the model...")
-		
-		annotator = Annotator(thickness=1, text_thickness=1, text_scale=0.4)
-		
-		camera_running = True
-		
-		with device as stream:
-			for frame in stream:
-				if not camera_running:
-					break
-				
-				try:
-					# Run object detection
-					detections = frame.detections[frame.detections.confidence > 0.55]
-					labels = [f"{model.labels[class_id]}: {score:0.2f}" 
-							 for _, score, class_id, _ in detections]
-					
-					# Annotate the frame with bounding boxes and labels
-					annotator.annotate_boxes(frame, detections, labels=labels)
-					
-					# Convert frame to cv2 image for encoding
-					# Fix: Use frame.image instead of frame.data
-					if hasattr(frame, 'image'):
-						# If frame has an image attribute, use it
-						pil_img = frame.image
-						cv2_img = np.array(pil_img)
-						# Convert RGB to BGR for OpenCV
-						if cv2_img.shape[2] == 3:
-							cv2_img = cv2_img[:, :, ::-1].copy()
-					elif hasattr(frame, 'array'):
-						# Some versions might use array instead
-						cv2_img = frame.array.copy()
-					else:
-						# Fallback: try to get image directly
-						cv2_img = np.array(frame)
-					
-					# Encode the frame in JPEG format
-					_, encoded_image = cv2.imencode('.jpg', cv2_img)
-					
-					# Update the output frame
-					with lock:
-						output_frame = encoded_image.tobytes()
-				
-				except Exception as e:
-					print(f"Error processing frame: {e}")
-				
-	except Exception as e:
-		print(f"Camera thread error: {e}")
-	finally:
-		camera_running = False
-		print("Camera stream ended")
+# Camera async context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: initialize camera and start frame processing
+    global camera_task
+    camera_task = asyncio.create_task(process_camera_frames())
+    print("Camera processing started")
+    
+    yield  # Here the FastAPI application runs
+    
+    # Shutdown: cancel the camera task
+    if camera_task:
+        camera_task.cancel()
+        try:
+            await camera_task
+        except asyncio.CancelledError:
+            print("Camera task cancelled")
 
-def generate_frames():
-	"""
-	Generator function to yield frames for the video stream
-	"""
-	global output_frame, lock
-	
-	# Default frame when no camera is available
-	blank_image = np.zeros((480, 640, 3), np.uint8)
-	cv2.putText(blank_image, "Waiting for camera...", (50, 240), 
-				cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-	_, default_frame = cv2.imencode('.jpg', blank_image)
-	default_frame = default_frame.tobytes()
-	
-	while True:
-		# Wait until we have a frame
-		with lock:
-			if output_frame is None:
-				frame_copy = default_frame
-			else:
-				# bytes objects don't have a copy method, just use the object directly
-				frame_copy = output_frame
-		
-		# Yield the frame in multipart/x-mixed-replace format
-		yield (b'--frame\r\n'
-			   b'Content-Type: image/jpeg\r\n\r\n' + frame_copy + b'\r\n')
-		
-		# Use the global frame rate
-		global frame_rate
-		# Calculate sleep time based on frame rate (avoid division by zero)
-		sleep_time = 1.0 / max(frame_rate, 1)
-		time.sleep(sleep_time)
+# Create FastAPI app with the lifespan context manager
+app = FastAPI(lifespan=lifespan)
 
-@app.route('/')
-def index():
-	"""Serve the index page"""
-	return render_template('index.html')
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.route('/video_feed')
-def video_feed():
-	"""
-	Route for streaming the video feed
-	"""
-	return Response(generate_frames(),
-				   mimetype='multipart/x-mixed-replace; boundary=frame')
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
 
-@app.route('/start_camera')
-def start_camera():
-	"""Start the camera thread if it's not already running"""
-	global camera_running
-	
-	if not camera_running:
-		thread = threading.Thread(target=detect_objects)
-		thread.daemon = True
-		thread.start()
-		return "Camera started"
-	return "Camera is already running"
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"Client connected. Total connections: {len(self.active_connections)}")
 
-@app.route('/stop_camera')
-def stop_camera():
-	"""Stop the camera thread"""
-	global camera_running
-	camera_running = False
-	return "Camera stopped"
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            print(f"Client disconnected. Remaining connections: {len(self.active_connections)}")
 
-@app.route('/status')
-def status():
-	"""Return the status of the camera"""
-	global camera_running, frame_rate
-	return {"running": camera_running, "frame_rate": frame_rate}
+    async def broadcast(self, message: str):
+        disconnected_clients = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                print(f"Error sending to client: {e}")
+                disconnected_clients.append(connection)
+        
+        # Clean up any disconnected clients
+        for client in disconnected_clients:
+            if client in self.active_connections:
+                self.active_connections.remove(client)
 
-@app.route('/set_frame_rate/<int:rate>')
-def set_frame_rate(rate):
-	"""Set the frame rate"""
-	global frame_rate
-	# Ensure frame rate is within reasonable bounds
-	if 1 <= rate <= 30:
-		frame_rate = rate
-		return {"success": True, "frame_rate": frame_rate}
-	return {"success": False, "message": "Frame rate must be between 1 and 60 FPS"}
+manager = ConnectionManager()
 
-if __name__ == '__main__':
-	# Create a directory for templates if it doesn't exist
-	import os
-	if not os.path.exists('templates'):
-		os.makedirs('templates')
-	
-	# Create a simple HTML template for viewing the stream
-	with open('templates/index.html', 'w') as f:
-		f.write("""
-		<!DOCTYPE html>
-		<html>
-		<head>
-			<title>ModLib Camera Stream</title>
-			<style>
-				body { font-family: Arial, sans-serif; text-align: center; margin: 20px; background-color: #f5f5f5; }
-				.container { max-width: 800px; margin: 0 auto; background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-				.video-container { margin: 20px 0; border: 1px solid #ddd; border-radius: 5px; overflow: hidden; }
-				.controls { margin: 20px 0; }
-				button { padding: 10px 20px; margin: 0 10px; cursor: pointer; background-color: #4CAF50; color: white; border: none; border-radius: 5px; }
-				button:hover { background-color: #45a049; }
-				.status { margin-top: 10px; font-style: italic; color: #666; }
-				h1 { color: #333; }
-				.info { font-size: 14px; margin-top: 20px; text-align: left; background-color: #f9f9f9; padding: 10px; border-radius: 5px; }
-				.slider-container { margin: 20px 0; text-align: left; padding: 10px; background-color: #f0f0f0; border-radius: 5px; }
-				.slider-container label { display: inline-block; width: 100px; }
-				.slider { width: 300px; }
-				.value-display { display: inline-block; margin-left: 10px; width: 40px; text-align: center; }
-			</style>
-			<script>
-				// Check camera status every 3 seconds
-				function checkStatus() {
-					fetch('/status')
-						.then(response => response.json())
-						.then(data => {
-							document.getElementById('status').innerText = 
-								data.running ? 'Camera is running' : 'Camera is stopped';
-							
-							// Update the frame rate slider to match server
-							document.getElementById('frame-rate').value = data.frame_rate;
-							document.getElementById('frame-rate-value').innerText = data.frame_rate;
-						});
-				}
-				
-				// Update frame rate on the server
-				function updateFrameRate(value) {
-					document.getElementById('frame-rate-value').innerText = value;
-					fetch(`/set_frame_rate/${value}`)
-						.then(response => response.json())
-						.then(data => {
-							console.log('Frame rate updated:', data);
-						});
-				}
-				
-				// Start checking status when page loads
-				window.onload = function() {
-					checkStatus();
-					setInterval(checkStatus, 3000);
-				}
-			</script>
-		</head>
-		<body>
-			<div class="container">
-				<h1>ModLib Camera Stream</h1>
-				<div class="video-container">
-					<img src="{{ url_for('video_feed') }}" width="100%">
-				</div>
-				<div class="controls">
-					<button onclick="fetch('/start_camera').then(() => checkStatus())">Start Camera</button>
-					<button onclick="fetch('/stop_camera').then(() => checkStatus())">Stop Camera</button>
-				</div>
-				<div class="status" id="status">Checking camera status...</div>
-				
-				<div class="slider-container">
-					<label for="frame-rate">Frame Rate:</label>
-					<input type="range" id="frame-rate" class="slider" min="1" max="60" value="30" 
-						   oninput="updateFrameRate(this.value)">
-					<span id="frame-rate-value" class="value-display">30</span> FPS
-				</div>
-				
-				<div class="info">
-					<p><strong>Network Info:</strong> This stream is accessible at:</p>
-					<ul>
-						<li>http://127.0.0.1:5000 (local access)</li>
-						<li>http://[your-ip-address]:5000 (same network access)</li>
-					</ul>
-					<p>To view from another device, enter the above URL in your browser.</p>
-				</div>
-			</div>
-		</body>
-		</html>
-		""")
-	
-	# Get the machine's IP addresses
-	import socket
-	def get_ip_addresses():
-		ip_list = []
-		# Get all network interfaces
-		try:
-			# Get all interfaces except loopback
-			interfaces = socket.getaddrinfo(socket.gethostname(), None)
-			for info in interfaces:
-				ip = info[4][0]
-				# Only include IPv4 addresses and exclude localhost
-				if '.' in ip and ip != '127.0.0.1':
-					ip_list.append(ip)
-		except Exception as e:
-			print(f"Error getting IP addresses: {e}")
-			# Fallback method
-			s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-			try:
-				# Doesn't even have to be reachable
-				s.connect(('10.255.255.255', 1))
-				ip = s.getsockname()[0]
-				ip_list.append(ip)
-			except Exception:
-				ip_list.append('127.0.0.1')
-			finally:
-				s.close()
-		return ip_list
+# Main camera processing function
+async def process_camera_frames():
+    global last_frame, frame_rate
+    
+    try:
+        print("Initializing AI Camera...")
+        
+        
+        try:
+            print("Deploying model...")
+            device.deploy(model)
+            print("Model deployed successfully")
+        except RuntimeError as e:
+            print(f"Warning: Failed to deploy model: {e}")
+            print("Continuing without redeploying the model...")
+        
+        annotator = Annotator(thickness=1, text_thickness=1, text_scale=0.4)
+        
+        print("Starting camera stream...")
+        with device as stream:
+            for frame in stream:
+                # print("here 2")
+                try:
+                    # Process current frame
+                    start_time = time.time()
+                    
+                    # Run object detection
+                    detections = frame.detections[frame.detections.confidence > 0.55]
+                    labels = [f"{model.labels[class_id]}: {score:0.2f}" 
+                             for _, score, class_id, _ in detections]
+                    
+                    # Annotate the frame
+                    annotator.annotate_boxes(frame, detections, labels=labels)
+                    
+                    # Convert frame to cv2 image
+                    if hasattr(frame, 'image'):
+                        pil_img = frame.image
+                        cv2_img = np.array(pil_img)
+                        if cv2_img.shape[2] == 3:
+                            cv2_img = cv2_img[:, :, ::-1].copy()
+                    elif hasattr(frame, 'array'):
+                        cv2_img = frame.array.copy()
+                    else:
+                        cv2_img = np.array(frame)
+                    
+                    # Encode to base64
+                    _, buffer = cv2.imencode('.jpg', cv2_img)
+                    img_base64 = base64.b64encode(buffer).decode('utf-8')
+                    
+                    # Update the last frame
+                    last_frame = img_base64
+                    
+                    # Broadcast the frame if we have active connections
+                    if manager.active_connections:
+                        await manager.broadcast(img_base64)
+                    
+                    # Calculate processing time and sleep to maintain frame rate
+                    process_time = time.time() - start_time
+                    sleep_time = max(0, (1.0 / frame_rate) - process_time)
+                    
+                    if sleep_time > 0:
+                        await asyncio.sleep(sleep_time)
+                    
+                except asyncio.CancelledError:
+                    print("Camera processing cancelled")
+                    break
+                except Exception as e:
+                    print(f"Error processing frame: {e}")
+                    await asyncio.sleep(0.1)  # Brief pause on error
+                
+                # Allow other tasks to run
+                await asyncio.sleep(0)
+    
+    except Exception as e:
+        print(f"Camera error: {e}")
+    finally:
+        print("Camera stream ended")
 
-	# Print server information with clear spacing
-	port = 5000
-	print("\n" + "="*80)
-	print("⚡ STARTING CAMERA SERVER ⚡")
-	print("="*80)
-	print("\n📱 Access the camera stream from your devices at:")
-	
-	ip_addresses = get_ip_addresses()
-	for ip in ip_addresses:
-		print(f"\n    http://{ip}:{port}")
-	
-	print("\n" + "="*80 + "\n")
-	
-	# Run the Flask app
-	app.run(host='0.0.0.0', port=port, debug=True, threaded=True)
+# HTML page for testing
+@app.get("/", response_class=HTMLResponse)
+async def get():
+    return """
+    <!DOCTYPE html>
+    <html>
+        <head>
+            <title>Camera WebSocket Test</title>
+            <style>
+                body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+                img { max-width: 100%; border: 1px solid #ddd; margin: 20px 0; }
+                button { padding: 10px 20px; margin: 5px; cursor: pointer; }
+                .controls { margin: 20px 0; }
+            </style>
+        </head>
+        <body>
+            <h1>Camera WebSocket Test</h1>
+            <div>
+                <img id="cameraFeed" src="" alt="Camera Feed" />
+            </div>
+            <div class="controls">
+                <button onclick="setFrameRate(15)">15 FPS</button>
+                <button onclick="setFrameRate(30)">30 FPS</button>
+            </div>
+            <div id="status">Connecting...</div>
+            
+            <script>
+                let ws;
+                let reconnectTimer;
+                
+                function connectWebSocket() {
+                    ws = new WebSocket("ws://" + window.location.host + "/live");
+                    
+                    ws.onopen = function(event) {
+                        clearTimeout(reconnectTimer);
+                        document.getElementById("status").textContent = "Connected";
+                    };
+                    
+                    ws.onmessage = function(event) {
+                        document.getElementById("cameraFeed").src = "data:image/jpeg;base64," + event.data;
+                    };
+                    
+                    ws.onclose = function(event) {
+                        document.getElementById("status").textContent = "Disconnected - Reconnecting...";
+                        reconnectTimer = setTimeout(connectWebSocket, 2000);
+                    };
+                    
+                    ws.onerror = function(error) {
+                        console.error("WebSocket error:", error);
+                    };
+                }
+                
+                function setFrameRate(fps) {
+                    fetch("/set_frame_rate/" + fps)
+                        .then(response => response.json())
+                        .then(data => {
+                            console.log("Frame rate set to:", data.frame_rate);
+                        })
+                        .catch(error => {
+                            console.error("Error setting frame rate:", error);
+                        });
+                }
+                
+                // Connect when page loads
+                connectWebSocket();
+            </script>
+        </body>
+    </html>
+    """
+
+# WebSocket endpoint for camera stream
+@app.websocket("/live")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    
+    # Send the current frame immediately if available
+    if last_frame:
+        await websocket.send_text(last_frame)
+    
+    try:
+        while True:
+            # Wait for any commands from client (optional)
+            data = await websocket.receive_text()
+            print(f"Received from client: {data}")
+            
+            # Process commands if needed (not implemented here)
+    
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
+# API endpoint to get camera status
+@app.get("/status")
+async def get_status():
+    global camera_task, frame_rate
+    return {
+        "running": camera_task is not None and not camera_task.done(),
+        "frame_rate": frame_rate,
+        "active_connections": len(manager.active_connections)
+    }
+
+# API endpoint to set frame rate
+@app.get("/set_frame_rate/{rate}")
+async def set_frame_rate(rate: int):
+    global frame_rate
+    if 1 <= rate <= 60:
+        frame_rate = rate
+        return {"success": True, "frame_rate": frame_rate}
+    return {"success": False, "message": "Frame rate must be between 1 and 60 FPS"}
+
+if __name__ == "__main__":
+    # Get the machine's IP addresses for display
+    import socket
+    def get_ip_addresses():
+        ip_list = []
+        try:
+            interfaces = socket.getaddrinfo(socket.gethostname(), None)
+            for info in interfaces:
+                ip = info[4][0]
+                if '.' in ip and ip != '127.0.0.1':
+                    ip_list.append(ip)
+        except Exception as e:
+            print(f"Error getting IP addresses: {e}")
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(('10.255.255.255', 1))
+                ip = s.getsockname()[0]
+                ip_list.append(ip)
+            except Exception:
+                ip_list.append('127.0.0.1')
+            finally:
+                s.close()
+        return ip_list
+    
+    # Print server information
+    port = 5000
+    print("\n" + "="*80)
+    print("⚡ STARTING FASTAPI ASYNC CAMERA SERVER ⚡")
+    print("="*80)
+    print("\n📱 Access the camera stream from your devices at:")
+    
+    ip_addresses = get_ip_addresses()
+    for ip in ip_addresses:
+        print(f"\n    http://{ip}:{port}")
+        print(f"    WebSocket: ws://{ip}:{port}/live")
+    
+    print("\n" + "="*80 + "\n")
+    
+    # Run the FastAPI app
+    uvicorn.run(app, host="0.0.0.0", port=port)

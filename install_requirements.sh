@@ -9,17 +9,6 @@ if ! command -v python3 &> /dev/null; then
     sudo apt-get install -y python3 python3-pip
 fi
 
-# Check if virtualenv is installed
-# if ! command -v virtualenv &> /dev/null; then
-#     echo "virtualenv is not installed. Installing virtualenv..."
-#     pip3 install virtualenv
-# fi
-
-# Create and activate virtual environment
-# echo "Creating virtual environment..."
-# python3 -m virtualenv venv
-# source venv/bin/activate
-
 # Install requirements
 echo "Installing requirements..."
 pip3 install -r requirements.txt

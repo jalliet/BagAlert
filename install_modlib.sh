@@ -8,7 +8,7 @@ sudo apt install python3-opencv python3-munkres python3-picamera2
 
 python -m venv .venv --system-site-packages
 . .venv/bin/activate
-pip install modlib-1.0.0-py3-none-any.whl
+pip install ../aitrios-rpi-application-module-library/dist/modlib-1.0.0-py3-none-any.whl
 
 echo "ModLib installation complete!"
 
